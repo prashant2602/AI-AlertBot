@@ -176,6 +176,253 @@ def get_alert_summary(user: AuthUser) -> dict:
         conn.close()
 
 
+def create_alert(
+    user: AuthUser,
+    project_name: str,
+    title: str,
+    description: str = "",
+    severity: str = "medium",
+    category: str = "general",
+    assigned_to: str = None,
+) -> dict:
+    """Create a new alert. PMs can only create for their assigned projects."""
+    conn = get_connection()
+    try:
+        project = conn.execute(
+            "SELECT id, name FROM projects WHERE LOWER(name) LIKE LOWER(?)",
+            (f"%{project_name}%",)
+        ).fetchone()
+
+        if not project:
+            return {"error": f"Project '{project_name}' not found."}
+
+        if not user.is_admin and project["id"] not in user.project_ids:
+            return {"error": f"You don't have access to project '{project['name']}'."}
+
+        # Validate assigned_to user exists if provided
+        assignee = None
+        if assigned_to:
+            assignee = conn.execute(
+                "SELECT username, full_name, role FROM users WHERE username = ? AND is_active = 1",
+                (assigned_to,)
+            ).fetchone()
+            if not assignee:
+                return {"error": f"User '{assigned_to}' not found."}
+
+        cursor = conn.execute("""
+            INSERT INTO alerts
+                (project_id, title, description, severity, category, status, raised_by, assigned_to, alert_date)
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, datetime('now'))
+        """, (project["id"], title, description, severity, category, user.username, assigned_to))
+        conn.commit()
+
+        alert_id = cursor.lastrowid
+
+        # Get PMs for this project
+        pms = conn.execute("""
+            SELECT u.username, u.full_name
+            FROM project_assignments pa JOIN users u ON u.id = pa.user_id
+            WHERE pa.project_id = ? AND u.role = 'pm'
+        """, (project["id"],)).fetchall()
+
+        return {
+            "created": True,
+            "alert_id": alert_id,
+            "title": title,
+            "project": project["name"],
+            "severity": severity,
+            "category": category,
+            "status": "open",
+            "raised_by": user.full_name,
+            "assigned_to": dict(assignee) if assignee else None,
+            "project_managers": [dict(p) for p in pms],
+        }
+    finally:
+        conn.close()
+
+
+def assign_alert(user: AuthUser, alert_id: int, assigned_to: str) -> dict:
+    """Assign an alert to a user. RBAC enforced."""
+    conn = get_connection()
+    try:
+        rbac_clause, rbac_params = _project_filter_clause(user)
+        alert = conn.execute(f"""
+            SELECT a.id, a.title, p.name AS project_name, p.id AS project_id
+            FROM alerts a JOIN projects p ON a.project_id = p.id
+            WHERE a.id = ? {rbac_clause}
+        """, [alert_id] + rbac_params).fetchone()
+
+        if not alert:
+            return {"error": f"Alert #{alert_id} not found or not accessible."}
+
+        assignee = conn.execute(
+            "SELECT username, full_name, role FROM users WHERE username = ? AND is_active = 1",
+            (assigned_to,)
+        ).fetchone()
+
+        if not assignee:
+            return {"error": f"User '{assigned_to}' not found."}
+
+        conn.execute("UPDATE alerts SET assigned_to = ? WHERE id = ?", (assigned_to, alert_id))
+        conn.commit()
+
+        # Get PMs for this project
+        pms = conn.execute("""
+            SELECT u.username, u.full_name
+            FROM project_assignments pa JOIN users u ON u.id = pa.user_id
+            WHERE pa.project_id = ? AND u.role = 'pm'
+        """, (alert["project_id"],)).fetchall()
+
+        return {
+            "assigned": True,
+            "alert_id": alert_id,
+            "alert_title": alert["title"],
+            "project": alert["project_name"],
+            "assigned_to_username": assignee["username"],
+            "assigned_to_name": assignee["full_name"],
+            "assigned_to_role": assignee["role"],
+            "project_managers": [dict(p) for p in pms],
+        }
+    finally:
+        conn.close()
+
+
+def add_alert_comment(user: AuthUser, alert_id: int, comment_text: str) -> dict:
+    """Add a comment to an alert. RBAC enforced."""
+    conn = get_connection()
+    try:
+        rbac_clause, rbac_params = _project_filter_clause(user)
+        alert = conn.execute(f"""
+            SELECT a.id, a.title, p.name AS project_name
+            FROM alerts a JOIN projects p ON a.project_id = p.id
+            WHERE a.id = ? {rbac_clause}
+        """, [alert_id] + rbac_params).fetchone()
+
+        if not alert:
+            return {"error": f"Alert #{alert_id} not found or not accessible."}
+
+        conn.execute("""
+            INSERT INTO alert_comments (alert_id, username, full_name, comment)
+            VALUES (?, ?, ?, ?)
+        """, (alert_id, user.username, user.full_name, comment_text))
+        conn.commit()
+
+        return {
+            "commented": True,
+            "alert_id": alert_id,
+            "alert_title": alert["title"],
+            "project": alert["project_name"],
+            "comment": comment_text,
+            "by_username": user.username,
+            "by_name": user.full_name,
+        }
+    finally:
+        conn.close()
+
+
+def get_alert_comments(user: AuthUser, alert_id: int) -> dict:
+    """Get all comments for an alert. RBAC enforced."""
+    conn = get_connection()
+    try:
+        rbac_clause, rbac_params = _project_filter_clause(user)
+        alert = conn.execute(f"""
+            SELECT a.id, a.title, a.status, a.severity, a.assigned_to,
+                   p.name AS project_name
+            FROM alerts a JOIN projects p ON a.project_id = p.id
+            WHERE a.id = ? {rbac_clause}
+        """, [alert_id] + rbac_params).fetchone()
+
+        if not alert:
+            return {"error": f"Alert #{alert_id} not found or not accessible."}
+
+        comments = conn.execute("""
+            SELECT id, username, full_name, comment, created_at
+            FROM alert_comments
+            WHERE alert_id = ?
+            ORDER BY created_at ASC
+        """, (alert_id,)).fetchall()
+
+        return {
+            "alert_id": alert_id,
+            "alert_title": alert["title"],
+            "project": alert["project_name"],
+            "severity": alert["severity"],
+            "status": alert["status"],
+            "assigned_to": alert["assigned_to"],
+            "comments": [dict(c) for c in comments],
+            "total_comments": len(comments),
+        }
+    finally:
+        conn.close()
+
+
+def delete_alert(user: AuthUser, alert_id: int) -> dict:
+    """Delete an alert. Admins can delete any; PMs only from their projects."""
+    conn = get_connection()
+    try:
+        rbac_clause, rbac_params = _project_filter_clause(user)
+        alert = conn.execute(f"""
+            SELECT a.id, a.title, p.name AS project_name
+            FROM alerts a JOIN projects p ON a.project_id = p.id
+            WHERE a.id = ? {rbac_clause}
+        """, [alert_id] + rbac_params).fetchone()
+
+        if not alert:
+            return {"error": f"Alert #{alert_id} not found or not accessible."}
+
+        # Delete comments first (foreign key)
+        conn.execute("DELETE FROM alert_comments WHERE alert_id = ?", (alert_id,))
+        conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+        conn.commit()
+
+        return {
+            "deleted": True,
+            "alert_id": alert_id,
+            "alert_title": alert["title"],
+            "project": alert["project_name"],
+            "deleted_by": user.full_name,
+        }
+    finally:
+        conn.close()
+
+
+def update_alert_severity(user: AuthUser, alert_id: int, new_severity: str) -> dict:
+    """Admin-only: update the severity of an alert."""
+    if not user.is_admin:
+        return {"error": "Only admins can change alert severity."}
+
+    valid = ("critical", "high", "medium", "low", "info")
+    if new_severity.lower() not in valid:
+        return {"error": f"Invalid severity '{new_severity}'. Must be one of: {', '.join(valid)}."}
+
+    conn = get_connection()
+    try:
+        alert = conn.execute("""
+            SELECT a.id, a.title, a.severity, p.name AS project_name
+            FROM alerts a JOIN projects p ON a.project_id = p.id
+            WHERE a.id = ?
+        """, (alert_id,)).fetchone()
+
+        if not alert:
+            return {"error": f"Alert #{alert_id} not found."}
+
+        old_severity = alert["severity"]
+        conn.execute("UPDATE alerts SET severity = ? WHERE id = ?", (new_severity.lower(), alert_id))
+        conn.commit()
+
+        return {
+            "updated": True,
+            "alert_id": alert_id,
+            "alert_title": alert["title"],
+            "project": alert["project_name"],
+            "old_severity": old_severity,
+            "new_severity": new_severity.lower(),
+            "changed_by": user.full_name,
+        }
+    finally:
+        conn.close()
+
+
 def get_alerts_by_manager(user: AuthUser) -> list[dict]:
     """
     Admin-only: returns alert counts per project manager, ranked by total alerts.

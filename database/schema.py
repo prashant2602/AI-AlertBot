@@ -46,9 +46,21 @@ CREATE TABLE IF NOT EXISTS alerts (
     category     TEXT    NOT NULL DEFAULT 'general' CHECK(category IN ('performance', 'security', 'budget', 'schedule', 'quality', 'dependency', 'general')),
     status       TEXT    NOT NULL DEFAULT 'open' CHECK(status IN ('open', 'acknowledged', 'resolved', 'closed')),
     raised_by    TEXT    NOT NULL DEFAULT 'system',
+    assigned_to  TEXT,
     alert_date   TEXT    NOT NULL DEFAULT (datetime('now')),
     resolved_at  TEXT,
     created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+CREATE_ALERT_COMMENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS alert_comments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id   INTEGER NOT NULL REFERENCES alerts(id),
+    username   TEXT    NOT NULL,
+    full_name  TEXT    NOT NULL,
+    comment    TEXT    NOT NULL,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -57,4 +69,5 @@ ALL_TABLES = [
     CREATE_PROJECTS_TABLE,
     CREATE_PROJECT_ASSIGNMENTS_TABLE,
     CREATE_ALERTS_TABLE,
+    CREATE_ALERT_COMMENTS_TABLE,
 ]
